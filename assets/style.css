@@ -1,0 +1,19 @@
+/* InsureIQ — Master Stylesheet (reference / override layer)
+   Main styles are injected inline via st.markdown in app.py for Streamlit compat.
+   This file can be loaded via st.markdown("<style>...</style>") if needed.
+*/
+
+:root {
+    --navy:  #0A2342;
+    --blue:  #1B6CA8;
+    --cyan:  #00B4D8;
+    --green: #2ECC71;
+    --amber: #F39C12;
+    --red:   #E74C3C;
+    --gray:  #636E72;
+    --light: #F8F9FA;
+    --white: #FFFFFF;
+    --text:  #2D3436;
+}
+
+html, body { font-family: 'Inter', sans-serif; }

@@ -1,0 +1,330 @@
+================================================================================
+              HEALTH INSURANCE POLICY SIMPLIFIER — PROJECT INFO
+================================================================================
+
+1. PROJECT OVERVIEW
+================================================================================
+
+    This project is a RAG (Retrieval-Augmented Generation) system that lets
+    users ask plain-English questions about health insurance coverage (e.g.,
+    "Is knee surgery covered?") and receive structured answers — Yes / No /
+    Partial — backed by exact citations (page, section, quote) from real policy
+    PDF documents.
+
+    Instead of forcing users to read dense, jargon-heavy policy documents, the
+    system reads them once, indexes the content semantically, and answers
+    questions on demand — like having an insurance expert available 24/7.
+
+
+2. RELEVANCE & PROBLEM STATEMENT
+================================================================================
+
+    WHY THIS PROJECT MATTERS:
+
+    • Health insurance policies are long (50–200 pages), filled with legal
+      jargon, exclusions, sub-limits, and waiting periods.
+    • Policyholders often don't know what's covered until a claim is rejected.
+    • Manual reading is time-consuming; searching plain keywords misses context.
+
+    WHAT THIS SOLVES:
+
+    • Converts complex PDFs into searchable, semantically indexed chunks.
+    • Uses AI to understand questions and retrieve the right passages even when
+      the user's wording doesn't match the policy's terminology.
+    • Provides verifiable answers with exact quotes and page numbers, so users
+      don't have to blindly trust the AI.
+    • Highlights caveats (waiting periods, sub-limits, co-payments) so users
+      get the full picture, not just a "yes" or "no."
+
+
+3. APPROACH — HOW IT WORKS (STEP BY STEP)
+================================================================================
+
+    The system follows a 6-phase pipeline, each phase handled by one file:
+
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │                                                                     │
+    │   Google Drive  ──►  PDF Parser  ──►  Embeddings  ──►  Retriever   │
+    │   (Phase 1)          (Phase 2)        (Phase 3a)       (Phase 3b)  │
+    │                                                                     │
+    │                          ──►  Answer Chain  ──►  API  ──►  UI      │
+    │                               (Phase 4)         (Phase 5) (Phase 6)│
+    │                                                                     │
+    └─────────────────────────────────────────────────────────────────────┘
+
+    PHASE 1 — Data Acquisition (drive_downloader.py)
+    -------------------------------------------------
+    • Authenticates with Google Drive via a service account (credentials.json).
+    • Lists all PDFs in a specified Drive folder.
+    • Downloads them to ./data/policies/ locally.
+    • Skips files already downloaded (size-match check) to avoid redundancy.
+    • Normalises filenames for Windows compatibility.
+
+    PHASE 2 — PDF Parsing & Chunking (pdf_parser.py)
+    -------------------------------------------------
+    • Opens each PDF with pdfplumber (handles text-based PDFs).
+    • Extracts text page by page with character/line counts.
+    • Detects section headers using 3 heuristics:
+        1. Numbered headings (e.g., "4.1 Scope of Cover")
+        2. ALL-CAPS lines (e.g., "EXCLUSIONS")
+        3. Insurance keyword prefixes (e.g., "WAITING PERIOD", "BENEFITS")
+    • Chunks the document at ~800 tokens with 100-token overlap:
+        - Never splits mid-sentence (sentence-aware boundary detection).
+        - Each chunk records its source file, page range, section title,
+          and character offsets for full provenance.
+    • Outputs per-file JSON + a combined all_chunks.json.
+    • Stats: 32 PDFs → 1,410 chunks, average 784 tokens each.
+
+    PHASE 3a — Embedding & Storage (embeddings.py)
+    -----------------------------------------------
+    • Loads all_chunks.json produced by Phase 2.
+    • Embeds each chunk using the HuggingFace model "all-MiniLM-L6-v2"
+      (384-dimensional vectors, cosine similarity).
+    • Stores embeddings + metadata + original text in ChromaDB (local,
+      persistent, stored at ./data/chromadb/).
+    • Processes in batches of 128 for efficiency.
+    • Skips re-embedding if the collection already has the expected count
+      (use --reset to force re-embed).
+    • Result: 1,410 embeddings in ChromaDB ready for fast similarity search.
+
+    PHASE 3b — Multi-Query Retrieval (retriever.py)
+    ------------------------------------------------
+    • Takes the user's question and expands it into 3 query variants using
+      Claude (Anthropic API):
+        1. A more specific/technical version
+        2. A broader version capturing related concepts
+        3. A version using insurance terminology (exclusions, sub-limits, etc.)
+    • Always includes the original question too (so 4 queries total).
+    • Retrieves top-8 chunks per query from ChromaDB (cosine similarity).
+    • Deduplicates by chunk_id, keeping the best (highest) score.
+    • Returns the top-10 unique chunks sorted by relevance score.
+    • Falls back to heuristic expansion if the API key is missing.
+
+    WHY MULTI-QUERY?
+    A user might ask "Is knee surgery covered?" but the policy says
+    "Total Knee Replacement is admissible under Surgical Benefits."
+    Multi-query expansion bridges this vocabulary gap by generating
+    alternative phrasings that match how policies are actually written.
+
+    PHASE 4 — Answer Generation (answer_chain.py)
+    -----------------------------------------------
+    • Takes the user's question + top-10 retrieved chunks.
+    • Builds a context block: each chunk is formatted as a numbered excerpt
+      with its file/page/section metadata (max 24,000 chars).
+    • Sends a carefully crafted prompt to Claude with strict rules:
+        - Answer ONLY from provided excerpts (grounded generation).
+        - Classify as "Yes" / "No" / "Partial".
+        - Provide exact quotes, not paraphrases.
+        - Mention waiting periods, sub-limits, co-payments.
+        - Note conflicts between policies if present.
+    • Claude returns structured JSON with:
+        {
+            answer:      "Yes" | "No" | "Partial",
+            explanation: "2-4 sentence plain-English summary",
+            confidence:  0.0 – 1.0,
+            citations:   [ { filename, page, section, quote } ],
+            caveats:     [ "conditions, limitations, etc." ]
+        }
+    • Robust parsing: strips markdown fences, handles invalid JSON gracefully.
+    • Attaches _meta with timing info (retrieval time, generation time, etc.).
+
+    PHASE 5 — REST API (api.py)
+    ----------------------------
+    • FastAPI application with these endpoints:
+        POST /ask       — Main query endpoint (JSON body: {"question", "top_k"})
+        GET  /ask?q=... — Quick query via URL parameter
+        GET  /health    — Health check (returns status + embedding count)
+        GET  /stats     — Collection statistics
+        GET  /docs      — Swagger UI (auto-generated)
+    • Initialises heavy objects (EmbeddingStore, Retriever, AnswerChain) once
+      at startup via the lifespan context manager.
+    • CORS enabled for cross-origin frontend access.
+    • Pydantic request/response models for validation and documentation.
+
+    PHASE 6 — Streamlit Frontend (app.py)
+    --------------------------------------
+    • Interactive web UI built with Streamlit.
+    • Features:
+        - Text input for plain-English questions
+        - 8 sample questions as clickable buttons
+        - Colour-coded answer badge (green=Yes, red=No, yellow=Partial)
+        - Confidence progress bar (0–100%)
+        - Explanation section
+        - Expandable citation cards with exact quotes
+        - Caveats/conditions list
+        - Timing breakdown (retrieval, generation, total, round-trip)
+    • Sidebar: configurable API URL, chunk count slider, live health check.
+    • Custom CSS for professional appearance.
+
+
+4. DESIGN CLARITY — ARCHITECTURE & KEY DECISIONS
+================================================================================
+
+    4.1  OVERALL ARCHITECTURE: RAG (Retrieval-Augmented Generation)
+    ----------------------------------------------------------------
+    The system does NOT feed entire PDFs to the LLM. Instead:
+
+        User Question
+              │
+              ▼
+        Query Expansion (Claude generates 3 paraphrases)
+              │
+              ▼
+        Semantic Search (ChromaDB returns top-10 chunks)
+              │
+              ▼
+        Context Assembly (format chunks with metadata)
+              │
+              ▼
+        Answer Generation (Claude reads only relevant excerpts)
+              │
+              ▼
+        Structured JSON Response
+
+    WHY RAG?
+    • LLMs have token limits — can't fit 32 PDFs (33 MB) in a prompt.
+    • Retrieval narrows focus to the 10 most relevant passages.
+    • Answers are grounded in actual text, reducing hallucination.
+    • Citations are traceable to exact pages.
+
+    4.2  KEY DESIGN DECISIONS
+    --------------------------
+
+    CHUNKING STRATEGY:
+    • ~800 tokens per chunk (fits well in LLM context alongside the prompt).
+    • 100-token overlap prevents losing context at chunk boundaries.
+    • Sentence-aware splitting prevents cutting ideas mid-thought.
+    • Each chunk carries full metadata (file, page range, section).
+
+    EMBEDDING MODEL — all-MiniLM-L6-v2:
+    • 384-dimensional vectors (fast, low memory).
+    • Good balance of speed and quality for semantic search.
+    • Runs locally (no API calls for embedding).
+    • Cosine similarity used for distance metric.
+
+    VECTOR DATABASE — ChromaDB:
+    • Local persistent storage (no external server needed).
+    • Supports cosine similarity out of the box.
+    • Lightweight, Python-native, easy to set up.
+
+    LLM — Claude (Anthropic):
+    • Used for two distinct tasks:
+        1. Query expansion (Phase 3b) — 300 max tokens, temperature 0.4
+        2. Answer generation (Phase 4) — 1500 max tokens, temperature 0.2
+    • Low temperature for deterministic, faithful answers.
+    • Structured JSON output enforced via system prompt.
+
+    MULTI-QUERY RETRIEVAL:
+    • Single query often misses relevant chunks due to vocabulary mismatch.
+    • 3 variants + original = 4 queries × 8 chunks = up to 32 candidates.
+    • Deduplication + scoring produces the best 10 unique chunks.
+
+    API-UI SEPARATION:
+    • FastAPI backend can be used standalone (Swagger UI, curl, other apps).
+    • Streamlit frontend is a separate client.
+    • This enables future mobile apps, chatbots, or integrations.
+
+
+5. FILE-BY-FILE REFERENCE
+================================================================================
+
+    FILE                   PHASE    ROLE
+    ─────────────────────  ───────  ──────────────────────────────────────
+    drive_downloader.py    Phase 1  Downloads PDFs from Google Drive
+    pdf_parser.py          Phase 2  Extracts text, detects sections, chunks
+    embeddings.py          Phase 3a Embeds chunks → ChromaDB
+    retriever.py           Phase 3b Multi-query expansion + retrieval
+    answer_chain.py        Phase 4  RAG answer generation via Claude
+    api.py                 Phase 5  FastAPI REST backend
+    app.py                 Phase 6  Streamlit interactive frontend
+    requirements.txt       —        Python dependencies
+    README.md              —        Project documentation
+
+
+6. DATA FLOW SUMMARY
+================================================================================
+
+    INPUT:
+        32 health insurance policy PDFs (33.68 MB total) hosted on Google Drive.
+
+    INTERMEDIATE:
+        ./data/policies/        — Downloaded PDFs
+        ./data/chunks/          — Parsed JSON chunks (1,410 chunks)
+        ./data/chromadb/        — Persistent vector store (1,410 embeddings)
+
+    OUTPUT:
+        Structured JSON answer delivered via REST API and rendered in Streamlit:
+        {
+            "answer": "Yes",
+            "explanation": "Knee replacement surgery is covered under ...",
+            "confidence": 0.92,
+            "citations": [
+                {
+                    "filename": "Star-Health-Policy.pdf",
+                    "page": 12,
+                    "section": "Surgical Benefits",
+                    "quote": "Total Knee Replacement ... covered up to ..."
+                }
+            ],
+            "caveats": ["Waiting period of 24 months applies"]
+        }
+
+
+7. TECH STACK SUMMARY
+================================================================================
+
+    COMPONENT               TECHNOLOGY              PURPOSE
+    ──────────────────────  ──────────────────────  ──────────────────────────
+    PDF Extraction          pdfplumber              Extract text from PDFs
+    Tokenization            tiktoken (cl100k_base)  Count tokens for chunking
+    Embeddings              sentence-transformers   Encode text to vectors
+                            (all-MiniLM-L6-v2)
+    Vector Store            ChromaDB (persistent)   Store & query embeddings
+    LLM                     Anthropic Claude        Query expansion & answers
+    Backend API             FastAPI + Uvicorn       REST endpoints
+    Frontend UI             Streamlit               Interactive web interface
+    Data Source             Google Drive API         Download policy PDFs
+    Language                Python 3.11             Everything
+
+
+8. HOW TO RUN (QUICK START)
+================================================================================
+
+    1. Install dependencies:
+       pip install -r requirements.txt
+
+    2. Set environment variables:
+       set DRIVE_FOLDER_ID=<your-google-drive-folder-id>
+       set ANTHROPIC_API_KEY=<your-anthropic-api-key>
+
+    3. Place credentials.json (Google service account key) in project root.
+
+    4. Run the pipeline in order:
+       python drive_downloader.py       # Step 1: Download PDFs
+       python pdf_parser.py             # Step 2: Parse & chunk
+       python embeddings.py --reset     # Step 3: Embed into ChromaDB
+       python retriever.py --test       # Step 4: Verify retrieval works
+       python api.py                    # Step 5: Start API server
+       streamlit run app.py             # Step 6: Launch UI (new terminal)
+
+    5. Open http://localhost:8501 in your browser and ask a question.
+
+
+9. STRENGTHS OF THIS DESIGN
+================================================================================
+
+    • MODULAR:       Each phase is a standalone script with its own --test mode.
+    • GROUNDED:      Answers cite exact quotes — no unsupported claims.
+    • TRANSPARENT:   Confidence scores, timing, and caveats give users full
+                     visibility into how reliable the answer is.
+    • EFFICIENT:     Multi-query retrieval finds relevant content even when the
+                     user's wording differs from the policy's language.
+    • OFFLINE-READY: Embeddings and ChromaDB run locally; only Claude needs
+                     an API call.
+    • IDEMPOTENT:    Re-running any phase safely skips already-processed data.
+    • EXTENSIBLE:    Adding new PDFs = re-run phases 1–3; no code changes needed.
+
+
+================================================================================
+                               END OF INFO
+================================================================================
