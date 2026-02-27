@@ -26,45 +26,125 @@ Google Drive PDFs → Parser/Chunker → Embeddings (ChromaDB)
 | `assets/style.css` | CSS variable reference |
 | `components/answer_card.py` | Reusable answer-card rendering component |
 
-## Setup
+## Installation & Setup
 
-### 1. Install dependencies
-
-```bash
-pip install google-api-python-client google-auth google-auth-httplib2 \
-            pdfplumber tiktoken chromadb sentence-transformers ollama \
-            fastapi uvicorn streamlit requests
-```
-
-### 2. Prerequisites
+### Prerequisites
 
 | Requirement | Details |
 |---|---|
-| **Ollama** | Install from [ollama.com](https://ollama.com), then run `ollama pull llama3` |
-| `DRIVE_FOLDER_ID` | Google Drive folder containing policy PDFs |
-| `credentials.json` | Google service account key — place in project root |
-| `HF_HUB_DISABLE_XET` | Set to `1` if HuggingFace xet transport stalls |
+| **Python** | 3.10 or later — [python.org/downloads](https://www.python.org/downloads/) |
+| **Ollama** | Local LLM runtime — [ollama.com](https://ollama.com) |
+| **Git** | (optional) To clone this repo |
+| **Google Service Account** | Only needed if downloading PDFs from Google Drive |
 
-### 3. Run the pipeline
+### Step 1 — Clone the repository
 
 ```bash
-# Step 1 — Download PDFs from Google Drive
+git clone https://github.com/karthikSuthari/Health-Insurance-Policy-Simplifier.git
+cd Health-Insurance-Policy-Simplifier
+```
+
+### Step 2 — Create a virtual environment
+
+```bash
+# Windows
+python -m venv .venv
+.venv\Scripts\activate
+
+# macOS / Linux
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+### Step 3 — Install Python dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+This installs: `google-api-python-client`, `google-auth`, `pdfplumber`, `tiktoken`, `chromadb`, `sentence-transformers`, `fastapi`, `uvicorn`, `streamlit`, `requests`.
+
+### Step 4 — Install & start Ollama
+
+1. Download and install Ollama from [ollama.com](https://ollama.com).
+2. Pull the llama3 model (~4.7 GB):
+
+```bash
+ollama pull llama3
+```
+
+3. Make sure the Ollama server is running (it starts automatically on install, or run manually):
+
+```bash
+ollama serve
+```
+
+> Ollama runs on `http://localhost:11434` by default.
+
+### Step 5 — Prepare the data (PDF pipeline)
+
+```bash
+# 5a — Download PDFs from Google Drive (requires credentials.json in project root)
 python drive_downloader.py
 
-# Step 2 — Parse & chunk PDFs
+# 5b — Parse & chunk all PDFs into JSON
 python pdf_parser.py
+# → Creates data/all_chunks.json (~5 MB, ~1,400 chunks)
 
-# Step 3 — Embed into ChromaDB
+# 5c — Generate embeddings and store in ChromaDB
 python embeddings.py --reset
+# → Creates data/chromadb/ with 1,410 embeddings (384-dim vectors)
+```
 
-# Step 4 — Start Ollama (if not already running)
-ollama serve
+> **Note:** If HuggingFace model download stalls, set the environment variable first:
+> - Windows: `$env:HF_HUB_DISABLE_XET="1"`
+> - Linux/macOS: `export HF_HUB_DISABLE_XET=1`
 
-# Step 5 — Start API server (port 8000)
+### Step 6 — Start the application
+
+Open **two terminals** (both with the virtual environment activated):
+
+**Terminal 1 — FastAPI backend (port 8000):**
+
+```bash
 python api.py
+```
 
-# Step 6 — Launch InsureIQ UI (port 8501, in another terminal)
+Wait until you see `Ready — 1410 embeddings loaded` in the console (~15–20 seconds on first run while loading the embedding model).
+
+**Terminal 2 — Streamlit frontend (port 8501):**
+
+```bash
 streamlit run app.py
+```
+
+### Step 7 — Open the app
+
+Open your browser and go to:
+
+```
+http://localhost:8501
+```
+
+You should see the **InsureIQ** dashboard with live API status in the top bar.
+
+---
+
+## Quick Start (TL;DR)
+
+```bash
+git clone https://github.com/karthikSuthari/Health-Insurance-Policy-Simplifier.git
+cd Health-Insurance-Policy-Simplifier
+python -m venv .venv && .venv\Scripts\activate      # Windows
+pip install -r requirements.txt
+ollama pull llama3
+
+python drive_downloader.py    # download PDFs
+python pdf_parser.py          # parse & chunk
+python embeddings.py --reset  # embed into ChromaDB
+
+python api.py                 # Terminal 1 — API on :8000
+streamlit run app.py          # Terminal 2 — UI  on :8501
 ```
 
 ### API Endpoints
